@@ -34,7 +34,21 @@ const SECURITY_HEADERS: Record<string, string> = {
   "X-Content-Type-Options": "nosniff",
   "X-Frame-Options": "DENY",
   "Referrer-Policy": "strict-origin-when-cross-origin",
+  "Permissions-Policy": "camera=(), microphone=(), geolocation=(), payment=(), usb=(), interest-cohort=()",
+  "Cross-Origin-Opener-Policy": "same-origin",
+  "Cross-Origin-Resource-Policy": "same-origin",
+  "X-Permitted-Cross-Domain-Policies": "none",
+  "Content-Security-Policy":
+    "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; img-src 'self' data:; font-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline' https://static.cloudflareinsights.com; connect-src 'self' https://cloudflareinsights.com; upgrade-insecure-requests",
 };
+
+const LINK_HEADER = [
+  `<${CANONICAL_ORIGIN}/>; rel="canonical"`,
+  `</llms.txt>; rel="describedby"; type="text/markdown"; title="LLM site index"`,
+  `</index.md>; rel="alternate"; type="text/markdown"; title="Markdown version of this page"`,
+  `</sitemap-index.xml>; rel="sitemap"; type="application/xml"`,
+  `</.well-known/security.txt>; rel="security"; type="text/plain"`,
+].join(", ");
 
 function redirect(location: string): Response {
   return new Response(null, {
@@ -183,22 +197,69 @@ async function faviconResponse(request: Request, env: Env): Promise<Response> {
   });
 }
 
+function markdownQuality(accept: string): { markdown: number; html: number } {
+  let markdown = 0;
+  let html = 0;
+  for (const part of accept.split(",")) {
+    const [rawType, ...params] = part.trim().toLowerCase().split(";");
+    const type = rawType.trim();
+    const qParam = params.map((param) => param.trim()).find((param) => param.startsWith("q="));
+    const quality = qParam ? Number(qParam.slice(2)) : 1;
+    if (!Number.isFinite(quality)) continue;
+    if (type === "text/markdown") markdown = quality;
+    if (type === "text/html" || type === "application/xhtml+xml") html = Math.max(html, quality);
+  }
+  return { markdown, html };
+}
+
+function wantsMarkdown(accept: string | null): boolean {
+  if (!accept) return false;
+  const { markdown, html } = markdownQuality(accept);
+  return markdown > 0 && markdown >= html;
+}
+
+function withVaryAccept(headers: Headers): void {
+  const vary = headers.get("Vary");
+  if (!vary) headers.set("Vary", "Accept");
+  else if (!vary.toLowerCase().split(",").some((part) => part.trim() === "accept")) {
+    headers.set("Vary", `${vary}, Accept`);
+  }
+}
+
 /**
  * Single-page site: HTML always declares https://demandremigration.com/ as canonical.
- * Mirror that in the Link header so Google never sees a conflicting signal
- * ("Duplicate, Google chose different canonical than user").
+ * The Link header mirrors that and also advertises the markdown and sitemap.
  */
 function withCanonicalLink(response: Response): Response {
-  if (response.status !== 200) return response;
-  const contentType = response.headers.get("content-type") ?? "";
-  if (!contentType.includes("text/html")) return response;
-
   const headers = new Headers(response.headers);
-  headers.set("Link", `<${CANONICAL_ORIGIN}/>; rel="canonical"`);
   for (const [name, value] of Object.entries(SECURITY_HEADERS)) headers.set(name, value);
+  const contentType = headers.get("content-type") ?? "";
+  if (response.status === 200 && contentType.includes("text/html")) {
+    headers.set("Link", LINK_HEADER);
+    withVaryAccept(headers);
+  }
   return new Response(response.body, {
     status: response.status,
     statusText: response.statusText,
+    headers,
+  });
+}
+
+async function markdownResponse(request: Request, env: Env): Promise<Response | null> {
+  const url = new URL(request.url);
+  const markdown = await env.ASSETS.fetch(
+    new Request(new URL("/index.md", url.origin), { method: "GET" }),
+  );
+  if (!markdown.ok || !markdown.body) return null;
+  const headers = new Headers(markdown.headers);
+  headers.set("Content-Type", "text/markdown; charset=utf-8");
+  headers.set("X-Robots-Tag", "noindex");
+  headers.set("Cache-Control", "public, max-age=0, must-revalidate");
+  headers.set("Link", LINK_HEADER);
+  withVaryAccept(headers);
+  for (const [name, value] of Object.entries(SECURITY_HEADERS)) headers.set(name, value);
+  return new Response(request.method === "HEAD" ? null : markdown.body, {
+    status: 200,
     headers,
   });
 }
@@ -235,6 +296,15 @@ export default {
           }
         }
         return redirect(plan.canonical.toString());
+      }
+
+      if (
+        (request.method === "GET" || request.method === "HEAD") &&
+        url.pathname === "/" &&
+        wantsMarkdown(request.headers.get("Accept"))
+      ) {
+        const markdown = await markdownResponse(request, env);
+        if (markdown) return markdown;
       }
 
       const assetResponse = await env.ASSETS.fetch(request);
